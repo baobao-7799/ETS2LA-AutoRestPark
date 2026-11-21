@@ -87,8 +87,8 @@ public class AutoRestParkPlugin : Plugin
     {
         Id = "fishleia.autorestpark",
         Name = "baobao-7799 自动休息区停靠",
-        Description = "无目的地（无任务）时自动接管方向盘油门，驶向最近的休息区并停在线内；缺油时优先前往加油站。停稳后触发游戏原生自动泊车。",
-        Version = "1.1.0",
+        Description = "无目的地（无任务）时自动接管方向盘油门，驶向最近的休息区或最近的加油站（哪个近去哪），并停在线内；停稳后触发游戏原生自动泊车。",
+        Version = "1.2.0",
         AuthorName = "baobao-7799",
         AppVersionSupport = new PluginVersionSupport { LowerBound = "2026.11.0" },
         Tags = new[] { "Driving", "AI", "Gameplay", "Navigation" }
@@ -223,7 +223,6 @@ public class AutoRestParkPlugin : Plugin
         // 无目的地 = 没有当前任务（未接货/已送达/已取消）
         bool noDest = string.IsNullOrEmpty(td.configString.jobMarket) && !td.specialBool.onJob;
         bool lowFuel = td.truckBool.fuelWarning || td.truckFloat.fuel < cfg.FuelThreshold;
-        bool preferGas = lowFuel;
         bool userDriving = Math.Abs(td.truckFloat.userSteer) > 0.18f ||
                            td.truckFloat.userThrottle > 0.25f ||
                            td.truckFloat.userBrake > 0.08f;
@@ -237,12 +236,12 @@ public class AutoRestParkPlugin : Plugin
         {
             _manualTrigger = false;
             _triggerTimer = 0f;
-            if (StartPlanning(pos, preferGas, cfg)) return;
+            if (StartPlanning(pos, cfg)) return;
         }
         else if (auto && _triggerTimer > cfg.TriggerDelaySeconds)
         {
             _triggerTimer = 0f;
-            if (StartPlanning(pos, preferGas, cfg)) return;
+            if (StartPlanning(pos, cfg)) return;
         }
 
         if (userDriving)
@@ -252,12 +251,12 @@ public class AutoRestParkPlugin : Plugin
                 ? $"待机（无目的地+缺油，出发倒计时 {Math.Max(0f, cfg.TriggerDelaySeconds - _triggerTimer):F1} s）"
                 : $"待机（无目的地，出发倒计时 {Math.Max(0f, cfg.TriggerDelaySeconds - _triggerTimer):F1} s）";
         else if (lowFuel)
-            _status = $"待机（缺油，前往加油站倒计时 {Math.Max(0f, cfg.TriggerDelaySeconds - _triggerTimer):F1} s）";
+            _status = $"待机（缺油，出发倒计时 {Math.Max(0f, cfg.TriggerDelaySeconds - _triggerTimer):F1} s）";
         else
-            _status = "待机（任务进行中，或点“立即前往休息区”）";
+            _status = "待机（任务进行中，或点“立即前往最近停靠点”）";
     }
 
-    private bool StartPlanning(Vector3 truckPos, bool preferGas, RestParkSettings cfg)
+    private bool StartPlanning(Vector3 truckPos, RestParkSettings cfg)
     {
         var map = GetMapData();
         if (map == null)
@@ -266,19 +265,20 @@ public class AutoRestParkPlugin : Plugin
             return false;
         }
 
-        var cands = FindCandidates(map, truckPos, preferGas);
+        // 最近停靠点 = 最近的休息区 与 最近的加油站 二者中更近的那个
+        var cands = FindCandidates(map, truckPos);
         if (cands.Count == 0)
         {
-            _status = preferGas ? "地图内未找到加油站" : "地图内未找到休息区";
+            _status = "地图内未找到休息区或加油站";
             _cooldownUntil = _now + cfg.FailCooldown;
             return false;
         }
 
-        // 已经在休息区/加油站旁边 → 不重复触发（防止停好后立刻又出发）
+        // 已经在停靠点旁边 → 不重复触发（防止停好后立刻又出发）
         float nearestDist = Vector3.Distance(cands[0].Item2, truckPos);
         if (nearestDist < cfg.ParkedProximityMeters)
         {
-            _status = preferGas ? "已在加油站旁，跳过" : "已在休息区旁，跳过";
+            _status = cands[0].Item3 ? "已在加油站旁，跳过" : "已在休息区旁，跳过";
             _cooldownUntil = _now + Math.Min(cfg.ReTriggerCooldown, 30f);
             return false;
         }
@@ -288,7 +288,7 @@ public class AutoRestParkPlugin : Plugin
         var planner = new RoutePlanner(map);
         float radius = cfg.SearchRadiusM;
         float sd = cfg.SampleDist;
-        _targetDesc = preferGas ? "加油站" : "休息区";
+        _targetDesc = candCopy[0].Item3 ? "加油站" : "休息区";
 
         _planTask = Task.Run(() =>
         {
@@ -573,7 +573,8 @@ public class AutoRestParkPlugin : Plugin
         catch { return null; }
     }
 
-    private static List<(Prefab, Vector3, bool)> FindCandidates(MapData map, Vector3 truckPos, bool preferGas)
+    // 收集休息区 + 加油站两类停靠点，合并后按离卡车距离排序（哪个近就优先哪个）
+    private static List<(Prefab, Vector3, bool)> FindCandidates(MapData map, Vector3 truckPos)
     {
         var list = new List<(Prefab, Vector3, bool)>();
         foreach (var kv in map.MapItems)
@@ -582,10 +583,10 @@ public class AutoRestParkPlugin : Plugin
             if (!p.ShowInUiMap) continue;
             if (p.Nodes == null || p.Nodes.Count == 0) continue;
             string m = p.Model.ToString().ToLowerInvariant();
-            bool isGas = m.Contains("gas") || m.Contains("fuel") || m.Contains("service");
+            bool isGas = m.Contains("gas") || m.Contains("fuel");
             bool isRest = m.Contains("rest") || m.Contains("hotel") || m.Contains("motel") ||
                           m.Contains("parking") || m.Contains("service");
-            if (preferGas ? !isGas : !isRest) continue;
+            if (!isGas && !isRest) continue;
             int oi = p.Origin < p.Nodes.Count ? p.Origin : 0;
             var origin = (Node)p.Nodes[oi];
             list.Add((p, origin.Position, isGas));
@@ -703,7 +704,7 @@ public class AutoRestParkPlugin : Plugin
         bool dirty = false;
         dirty |= ImGui.Checkbox("启用自动停靠", ref cfg.Enabled);
 
-        if (ImGui.Button("立即前往休息区"))
+        if (ImGui.Button("立即前往最近停靠点"))
             _manualTrigger = true;
         ImGui.SameLine();
         if (ImGui.Button("立即中止"))
@@ -716,7 +717,7 @@ public class AutoRestParkPlugin : Plugin
         ImGui.Separator();
 
         dirty |= ImGui.Checkbox("无目的地时自动前往", ref cfg.TriggerWhenNoDestination);
-        dirty |= ImGui.Checkbox("缺油时自动前往加油站", ref cfg.TriggerOnLowFuel);
+        dirty |= ImGui.Checkbox("缺油时自动前往", ref cfg.TriggerOnLowFuel);
         dirty |= ImGui.Checkbox("停稳后自动泊车 (Enter)", ref cfg.AutoActivate);
         dirty |= ImGui.Checkbox("停好后熄火", ref cfg.IgnitionOffAfterPark);
         dirty |= ImGui.SliderFloat("巡航速度 (m/s)", ref cfg.MaxSpeed, 15f, 30f);
