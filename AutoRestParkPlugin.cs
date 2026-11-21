@@ -61,7 +61,7 @@ public class AutoRestParkPlugin : Plugin
     private string _status = "待机";
     private float _stateTime;
     private float _cooldownUntil;
-    private float _stationaryTimer;
+    private float _triggerTimer;
 
     // 路径
     private List<Vector3> _polyline = new();
@@ -87,8 +87,8 @@ public class AutoRestParkPlugin : Plugin
     {
         Id = "fishleia.autorestpark",
         Name = "baobao-7799 自动休息区停靠",
-        Description = "未确认目的地或到达目的地时，自动驶向最近的休息区；缺油时优先加油站休息区，到点后停在线内并触发游戏原生自动泊车。",
-        Version = "1.0.0",
+        Description = "无目的地（无任务）时自动接管方向盘油门，驶向最近的休息区并停在线内；缺油时优先前往加油站。停稳后触发游戏原生自动泊车。",
+        Version = "1.1.0",
         AuthorName = "baobao-7799",
         AppVersionSupport = new PluginVersionSupport { LowerBound = "2026.11.0" },
         Tags = new[] { "Driving", "AI", "Gameplay", "Navigation" }
@@ -207,6 +207,7 @@ public class AutoRestParkPlugin : Plugin
     {
         if (_now < _cooldownUntil)
         {
+            _triggerTimer = 0f;
             _status = $"冷却中…（{_cooldownUntil - _now:F0} s）";
             return;
         }
@@ -214,37 +215,49 @@ public class AutoRestParkPlugin : Plugin
         bool ok = td.truckBool.engineEnabled && !td.truckBool.parkingBrake;
         if (!ok)
         {
-            _stationaryTimer = 0f;
+            _triggerTimer = 0f;
             _status = "待机（等待点火起步）";
             return;
         }
 
-        bool arrival = td.specialBool.jobFinished || td.specialBool.jobDelivered || td.specialBool.jobCancelled;
-        bool noJob = string.IsNullOrEmpty(td.configString.jobMarket);
+        // 无目的地 = 没有当前任务（未接货/已送达/已取消）
+        bool noDest = string.IsNullOrEmpty(td.configString.jobMarket) && !td.specialBool.onJob;
         bool lowFuel = td.truckBool.fuelWarning || td.truckFloat.fuel < cfg.FuelThreshold;
+        bool preferGas = lowFuel;
+        bool userDriving = Math.Abs(td.truckFloat.userSteer) > 0.18f ||
+                           td.truckFloat.userThrottle > 0.25f ||
+                           td.truckFloat.userBrake > 0.08f;
 
-        if (_speed < 0.5f) _stationaryTimer += dt;
-        else _stationaryTimer = 0f;
+        bool auto = !userDriving && ((cfg.TriggerWhenNoDestination && noDest) || (cfg.TriggerOnLowFuel && lowFuel));
 
-        bool auto = (cfg.TriggerOnArrival && arrival) ||
-                    (cfg.TriggerWhenNoJob && noJob && _stationaryTimer > cfg.StationaryTriggerSeconds);
+        if (auto) _triggerTimer += dt;
+        else _triggerTimer = 0f;
 
         if (_manualTrigger)
         {
             _manualTrigger = false;
-            if (StartPlanning(pos, lowFuel, cfg)) return;
+            _triggerTimer = 0f;
+            if (StartPlanning(pos, preferGas, cfg)) return;
         }
-        else if (auto)
+        else if (auto && _triggerTimer > cfg.TriggerDelaySeconds)
         {
-            if (StartPlanning(pos, lowFuel, cfg)) return;
+            _triggerTimer = 0f;
+            if (StartPlanning(pos, preferGas, cfg)) return;
         }
 
-        if (arrival) _status = "待机（已到达目的地，触发中…）";
-        else if (noJob) _status = $"待机（无任务停车 {_stationaryTimer:F0}/{cfg.StationaryTriggerSeconds:F0} s）";
-        else _status = "待机（任务进行中，或点“立即前往休息区”）";
+        if (userDriving)
+            _status = "待机（手动驾驶中，不接管）";
+        else if (noDest)
+            _status = lowFuel
+                ? $"待机（无目的地+缺油，出发倒计时 {Math.Max(0f, cfg.TriggerDelaySeconds - _triggerTimer):F1} s）"
+                : $"待机（无目的地，出发倒计时 {Math.Max(0f, cfg.TriggerDelaySeconds - _triggerTimer):F1} s）";
+        else if (lowFuel)
+            _status = $"待机（缺油，前往加油站倒计时 {Math.Max(0f, cfg.TriggerDelaySeconds - _triggerTimer):F1} s）";
+        else
+            _status = "待机（任务进行中，或点“立即前往休息区”）";
     }
 
-    private bool StartPlanning(Vector3 truckPos, bool lowFuel, RestParkSettings cfg)
+    private bool StartPlanning(Vector3 truckPos, bool preferGas, RestParkSettings cfg)
     {
         var map = GetMapData();
         if (map == null)
@@ -253,11 +266,20 @@ public class AutoRestParkPlugin : Plugin
             return false;
         }
 
-        var cands = FindCandidates(map, truckPos, lowFuel);
+        var cands = FindCandidates(map, truckPos, preferGas);
         if (cands.Count == 0)
         {
-            _status = "地图内未找到休息区/加油站";
+            _status = preferGas ? "地图内未找到加油站" : "地图内未找到休息区";
             _cooldownUntil = _now + cfg.FailCooldown;
+            return false;
+        }
+
+        // 已经在休息区/加油站旁边 → 不重复触发（防止停好后立刻又出发）
+        float nearestDist = Vector3.Distance(cands[0].Item2, truckPos);
+        if (nearestDist < cfg.ParkedProximityMeters)
+        {
+            _status = preferGas ? "已在加油站旁，跳过" : "已在休息区旁，跳过";
+            _cooldownUntil = _now + Math.Min(cfg.ReTriggerCooldown, 30f);
             return false;
         }
 
@@ -266,7 +288,7 @@ public class AutoRestParkPlugin : Plugin
         var planner = new RoutePlanner(map);
         float radius = cfg.SearchRadiusM;
         float sd = cfg.SampleDist;
-        _targetDesc = candCopy[0].Item3 ? "加油站" : "休息区";
+        _targetDesc = preferGas ? "加油站" : "休息区";
 
         _planTask = Task.Run(() =>
         {
@@ -693,13 +715,14 @@ public class AutoRestParkPlugin : Plugin
         }
         ImGui.Separator();
 
-        dirty |= ImGui.Checkbox("到达目的地时触发", ref cfg.TriggerOnArrival);
-        dirty |= ImGui.Checkbox("无任务停车时触发", ref cfg.TriggerWhenNoJob);
+        dirty |= ImGui.Checkbox("无目的地时自动前往", ref cfg.TriggerWhenNoDestination);
+        dirty |= ImGui.Checkbox("缺油时自动前往加油站", ref cfg.TriggerOnLowFuel);
         dirty |= ImGui.Checkbox("停稳后自动泊车 (Enter)", ref cfg.AutoActivate);
         dirty |= ImGui.Checkbox("停好后熄火", ref cfg.IgnitionOffAfterPark);
         dirty |= ImGui.SliderFloat("巡航速度 (m/s)", ref cfg.MaxSpeed, 15f, 30f);
         dirty |= ImGui.SliderFloat("低油阈值 (0~1)", ref cfg.FuelThreshold, 0.05f, 0.5f);
-        dirty |= ImGui.SliderFloat("无任务停车触发秒", ref cfg.StationaryTriggerSeconds, 3f, 30f);
+        dirty |= ImGui.SliderFloat("触发倒计时 (s)", ref cfg.TriggerDelaySeconds, 0f, 10f);
+        dirty |= ImGui.SliderFloat("已在休息区旁距离 (m)", ref cfg.ParkedProximityMeters, 30f, 200f);
         dirty |= ImGui.SliderFloat("转向增益", ref cfg.SteeringGain, 0.01f, 0.15f);
         dirty |= ImGui.SliderFloat("最大转向", ref cfg.MaxSteering, 0.2f, 0.7f);
         dirty |= ImGui.SliderFloat("前瞻时间 (s)", ref cfg.LookaheadTime, 0.3f, 1.2f);
