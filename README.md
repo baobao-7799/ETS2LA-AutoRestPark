@@ -2,13 +2,14 @@
 
 **Author: baobao-7799** · GPL-3.0-or-later
 
-自动前往最近的休息区并把车停好：没有确认目的地、或到达目的地时，插件自动规划路线，
-驶向最近的休息区（缺油时优先加油站休息区），到点减速、拉手刹、触发游戏原生自动泊车
+自动前往最近的休息区并把车停好：没有目的地（无任务）时，插件自动接管方向盘油门，
+驶向最近的休息区（快没油时改去加油站），到点减速、拉手刹、触发游戏原生自动泊车
 （倒车入库/侧方停车由游戏自动泊车完成）。
 
 ## How it works
 
-1. **触发**：任务完成/送达/取消（到达目的地），或无任务且停车 N 秒，或 UI 手动按钮。
+1. **触发**：无目的地（没有任务：未接货/已送达/已取消）且非手动驾驶时，确认 2 秒后自动出发；
+   快没油时（fuelWarning 或油量低于阈值）自动改去加油站；也可 UI 手动按钮立即出发。
 2. **选点**：在 ETS2LA 解析出的地图数据（TruckLib MapData）里找最近的休息区 prefab
    （模型名含 rest/hotel/motel/parking/service）；缺油时优先 gas/fuel/service 类。
 3. **寻路**：自研 A*（顶点 = 道路节点；边 = 道路长度，prefab 内部走 NavCurve 最短路径），
@@ -40,10 +41,11 @@
 | 参数 | 默认 | 说明 |
 | --- | --- | --- |
 | Enabled / ShowWindow | true | 总开关 / 显示设置窗 |
-| TriggerOnArrival | true | 到达目的地时触发 |
-| TriggerWhenNoJob | true | 无任务且停车 N 秒触发 |
-| StationaryTriggerSeconds | 8 | 无任务停车触发秒数 |
-| FuelThreshold | 0.2 | 油量比例低于此值时优先加油站 |
+| TriggerWhenNoDestination | true | 无目的地（无任务）时自动触发 |
+| TriggerOnLowFuel | true | 快没油时自动触发（优先加油站） |
+| TriggerDelaySeconds | 2 | 触发条件需稳定保持的秒数 |
+| ParkedProximityMeters | 80 | 已在休息区旁该距离内时跳过触发（防循环） |
+| FuelThreshold | 0.2 | 油量比例低于此值时判定缺油 |
 | ReTriggerCooldown / FailCooldown / UserCooldown | 300 / 60 / 10 | 各冷却（秒） |
 | MaxSpeed | 22 | 巡航速度上限 m/s |
 | SteeringGain / MaxSteering | 0.06 / 0.45 | 转向增益与上限 |
@@ -55,9 +57,10 @@
 
 ## Safety
 
-- 任何时刻用户转动方向盘/踩油门/踩刹车，插件立即释放控制。
+- 任何时刻用户转动方向盘/踩油门/踩刹车，插件立即释放控制（手动驾驶中也不会接管）。
 - 行驶中遇到前方车辆自动减速跟随，太近刹停。
-- 无任务停车触发前有确认时长，任务进行中不会自动触发。
+- 任务进行中且不缺油时不会自动触发；停靠完成/失败后进入冷却。
+- 已在休息区旁（ParkedProximityMeters 内）不会重复触发，防止停好后立刻又出发。
 - 寻路/泊车失败自动放弃并冷却，可在设置窗「立即中止」。
 
 ## Building
