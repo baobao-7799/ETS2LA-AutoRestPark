@@ -1,0 +1,57 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <OutputType>Library</OutputType>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>AutoRestPark</AssemblyName>
+    <RootNamespace>FishLeia.AutoRestPark</RootNamespace>
+    <Version>1.0.0</Version>
+    <EnableDynamicLoading>true</EnableDynamicLoading>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+  </PropertyGroup>
+
+  <!-- 引用宿主 ETS2LA 的程序集；运行时由 ETS2LA 的 PluginLoadContext 从宿主默认上下文解析，
+       因此全部 Private=false，不随插件复制。HintPath 指向本机 ETS2LA 安装目录。 -->
+  <ItemGroup>
+    <Reference Include="ETS2LA.Shared">
+      <HintPath>C:\Users\27510\AppData\Local\ETS2LA\current\ETS2LA.Shared.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="ETS2LA.Backend">
+      <HintPath>C:\Users\27510\AppData\Local\ETS2LA\current\ETS2LA.Backend.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="ETS2LA.Game">
+      <HintPath>C:\Users\27510\AppData\Local\ETS2LA\current\ETS2LA.Game.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="ETS2LA.Settings">
+      <HintPath>C:\Users\27510\AppData\Local\ETS2LA\current\ETS2LA.Settings.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="ETS2LA.Overlay">
+      <HintPath>C:\Users\27510\AppData\Local\ETS2LA\current\ETS2LA.Overlay.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="ETS2LA.Logging">
+      <HintPath>C:\Users\27510\AppData\Local\ETS2LA\current\ETS2LA.Logging.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Hexa.NET.ImGui">
+      <HintPath>C:\Users\27510\AppData\Local\ETS2LA\current\Hexa.NET.ImGui.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="TruckLib">
+      <HintPath>C:\Users\27510\AppData\Local\ETS2LA\current\TruckLib.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="TruckLib.Core">
+      <HintPath>C:\Users\27510\AppData\Local\ETS2LA\current\TruckLib.Core.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+</Project>
