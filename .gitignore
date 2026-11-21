@@ -1,0 +1,5 @@
+dist/
+.bootstrap/*.dll
+.bootstrap/*.exe
+.bootstrap/*.runtimeconfig.json
+.bootstrap/*.pdb
