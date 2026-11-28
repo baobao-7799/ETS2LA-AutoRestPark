@@ -3,6 +3,9 @@
 // via the game's own "activate" (Enter) control once the truck is stopped in the zone.
 // Copyright (C) 2026 baobao-7799
 // SPDX-License-Identifier: GPL-3.0-or-later
+//
+// v1.4: auto-ignition + parking-brake release + status logging to ets2la.log (1 msg/s max)
+//       so problems can be diagnosed from the log without asking the user.
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -30,6 +33,7 @@ public class AutoRestParkPlugin : Plugin
 {
     private const string DriveChannelId = "fishleia.autorestpark";
     private const string ParkChannelId = "fishleia.autorestpark.park";
+    private const string IgnChannelId = "fishleia.autorestpark.ign";
     private const string OutputTopic = "ETS2LA.Game.Output.ControlEvent";
     private const string SettingsFileName = "fishleia.autorestpark.json";
     private const string WindowTitle = "baobao-7799 自动休息区停靠";
@@ -79,6 +83,13 @@ public class AutoRestParkPlugin : Plugin
     private float _steer, _throttle, _brake;
     private bool _parkPulse, _activatePulse, _ignitionPulse;
 
+    // 点火与手刹（v1.4）
+    private bool _ignActive;
+    private bool _ignStrt;
+    private float _ignTimer;
+    private int _pbTries;
+    private float _pbTimer;
+
     // 停车序列
     private int _parkStage;
     private float _parkStageTime;
@@ -87,8 +98,8 @@ public class AutoRestParkPlugin : Plugin
     {
         Id = "fishleia.autorestpark",
         Name = "baobao-7799 自动休息区停靠",
-        Description = "无目的地（无任务）时自动接管方向盘油门，驶向最近的休息区或最近的加油站（哪个近去哪），并停在线内；停稳后触发游戏原生自动泊车。",
-        Version = "1.2.0",
+        Description = "无目的地（无任务）时自动接管方向盘油门，驶向最近的休息区或最近的加油站（哪个近去哪），并停在线内；停稳后触发游戏原生自动泊车。v1.4 支持自动点火+松手刹。",
+        Version = "1.4.0",
         AuthorName = "baobao-7799",
         AppVersionSupport = new PluginVersionSupport { LowerBound = "2026.11.0" },
         Tags = new[] { "Driving", "AI", "Gameplay", "Navigation" }
@@ -99,6 +110,7 @@ public class AutoRestParkPlugin : Plugin
     public override void Init()
     {
         _cfg = _settingsHandler.Load<RestParkSettings>(SettingsFileName) ?? new RestParkSettings();
+        Logger.Info($"AutoRestPark: init. 配置 → 自动触发(无目的地)={_cfg.TriggerWhenNoDestination}, 自动触发(缺油)={_cfg.TriggerOnLowFuel}, 自动点火={_cfg.AutoIgnition}");
     }
 
     public override void OnEnable()
@@ -108,7 +120,7 @@ public class AutoRestParkPlugin : Plugin
         {
             Title = WindowTitle,
             Width = 430,
-            Height = 490,
+            Height = 540,
             Alpha = 0.92f,
             Open = _cfg.ShowWindow
         }, RenderUI);
@@ -137,6 +149,19 @@ public class AutoRestParkPlugin : Plugin
     {
         _now = (float)_sw.Elapsed.TotalSeconds;
 
+        try
+        {
+            TickSafe();
+        }
+        catch (Exception ex)
+        {
+            Logger.Error($"AutoRestPark: Tick 异常 → {ex.GetType().Name}: {ex.Message}");
+            try { ReleaseOutput(); } catch { }
+        }
+    }
+
+    private void TickSafe()
+    {
         if (_settingsDirty && (_saveTimer -= 1f / TickRate) <= 0f)
         {
             _saveTimer = 1f;
@@ -157,7 +182,7 @@ public class AutoRestParkPlugin : Plugin
         if (!td.sdkActive || td.paused)
         {
             ReleaseOutput();
-            SetIdle("等待 SDK 数据…");
+            SetIdle("等待 SDK 数据…（请确认游戏内已开启 ETS2LA 插件）");
             return;
         }
 
@@ -198,6 +223,8 @@ public class AutoRestParkPlugin : Plugin
             PublishDrive();
         if (_parkPulse || _activatePulse || _ignitionPulse)
             PublishParkPulses();
+        if (_ignActive)
+            PublishIgnition();
         _parkPulse = _activatePulse = _ignitionPulse = false;
     }
 
@@ -208,15 +235,7 @@ public class AutoRestParkPlugin : Plugin
         if (_now < _cooldownUntil)
         {
             _triggerTimer = 0f;
-            _status = $"冷却中…（{_cooldownUntil - _now:F0} s）";
-            return;
-        }
-
-        bool ok = td.truckBool.engineEnabled && !td.truckBool.parkingBrake;
-        if (!ok)
-        {
-            _triggerTimer = 0f;
-            _status = "待机（等待点火起步）";
+            SetStatus($"冷却中…（{_cooldownUntil - _now:F0} s）");
             return;
         }
 
@@ -228,32 +247,96 @@ public class AutoRestParkPlugin : Plugin
                            td.truckFloat.userBrake > 0.08f;
 
         bool auto = !userDriving && ((cfg.TriggerWhenNoDestination && noDest) || (cfg.TriggerOnLowFuel && lowFuel));
+        bool armed = auto || _manualTrigger;
 
-        if (auto) _triggerTimer += dt;
-        else _triggerTimer = 0f;
+        if (!armed)
+        {
+            _triggerTimer = 0f;
+            _pbTries = 0;
+            _pbTimer = 0f;
+            if (_ignActive)
+            {
+                ReleaseIgnition();
+                _ignActive = false;
+            }
+            if (userDriving)
+                SetStatus("待机（手动驾驶中，不接管）");
+            else if (noDest)
+                SetStatus(lowFuel ? "待机（无目的地+缺油，等待确认）" : "待机（无目的地，等待确认）");
+            else if (lowFuel)
+                SetStatus("待机（缺油，等待确认）");
+            else
+                SetStatus("待机（任务进行中，或点“立即前往最近停靠点”）");
+            return;
+        }
 
+        // —— 点火起步：车没打火就自己打 ——
+        if (!td.truckBool.engineEnabled)
+        {
+            _triggerTimer = 0f;
+            _pbTries = 0;
+            _pbTimer = 0f;
+            if (!cfg.AutoIgnition)
+            {
+                SetStatus("待机（等待点火起步，或开启“自动点火”）");
+                return;
+            }
+            _ignTimer += dt;
+            _ignStrt = (_ignTimer % 2.5f) < 1.2f; // 每 2.5s 一轮：按住启动马达 1.2s
+            _ignActive = true;
+            SetStatus("正在点火…");
+            return;
+        }
+        if (_ignActive)
+        {
+            ReleaseIgnition();
+            _ignActive = false;
+        }
+
+        // —— 松手刹 ——
+        if (td.truckBool.parkingBrake)
+        {
+            _triggerTimer = 0f;
+            if (_pbTries >= 3)
+            {
+                SetStatus("待机（请手动松开手刹）");
+                return;
+            }
+            if (_pbTimer <= 0f)
+            {
+                _parkPulse = true; // TrueToToggle：翻一下手刹
+                _pbTries++;
+                _pbTimer = 1.5f;
+            }
+            else
+            {
+                _pbTimer -= dt;
+            }
+            SetStatus($"松开手刹中…（{_pbTries}/3）");
+            return;
+        }
+        _pbTries = 0;
+        _pbTimer = 0f;
+
+        // —— 触发出发 ——
         if (_manualTrigger)
         {
             _manualTrigger = false;
             _triggerTimer = 0f;
             if (StartPlanning(pos, cfg)) return;
         }
-        else if (auto && _triggerTimer > cfg.TriggerDelaySeconds)
+        else if (auto)
         {
-            _triggerTimer = 0f;
-            if (StartPlanning(pos, cfg)) return;
+            _triggerTimer += dt;
+            if (_triggerTimer > cfg.TriggerDelaySeconds)
+            {
+                _triggerTimer = 0f;
+                if (StartPlanning(pos, cfg)) return;
+            }
+            SetStatus(lowFuel
+                ? $"待机（缺油，出发倒计时 {Math.Max(0f, cfg.TriggerDelaySeconds - _triggerTimer):F1} s）"
+                : $"待机（无目的地，出发倒计时 {Math.Max(0f, cfg.TriggerDelaySeconds - _triggerTimer):F1} s）");
         }
-
-        if (userDriving)
-            _status = "待机（手动驾驶中，不接管）";
-        else if (noDest)
-            _status = lowFuel
-                ? $"待机（无目的地+缺油，出发倒计时 {Math.Max(0f, cfg.TriggerDelaySeconds - _triggerTimer):F1} s）"
-                : $"待机（无目的地，出发倒计时 {Math.Max(0f, cfg.TriggerDelaySeconds - _triggerTimer):F1} s）";
-        else if (lowFuel)
-            _status = $"待机（缺油，出发倒计时 {Math.Max(0f, cfg.TriggerDelaySeconds - _triggerTimer):F1} s）";
-        else
-            _status = "待机（任务进行中，或点“立即前往最近停靠点”）";
     }
 
     private bool StartPlanning(Vector3 truckPos, RestParkSettings cfg)
@@ -261,7 +344,8 @@ public class AutoRestParkPlugin : Plugin
         var map = GetMapData();
         if (map == null)
         {
-            _status = "地图数据未加载（等待 ETS2LA 解析地图）";
+            Logger.Warn($"AutoRestPark: 地图数据未加载 → {DescribeMap()}");
+            SetStatus("地图数据未加载（等待 ETS2LA 解析地图）");
             return false;
         }
 
@@ -269,7 +353,8 @@ public class AutoRestParkPlugin : Plugin
         var cands = FindCandidates(map, truckPos);
         if (cands.Count == 0)
         {
-            _status = "地图内未找到休息区或加油站";
+            Logger.Warn("AutoRestPark: 地图内未找到休息区或加油站（ShowInUiMap 过滤后为空）");
+            SetStatus("地图内未找到休息区或加油站");
             _cooldownUntil = _now + cfg.FailCooldown;
             return false;
         }
@@ -278,7 +363,8 @@ public class AutoRestParkPlugin : Plugin
         float nearestDist = Vector3.Distance(cands[0].Item2, truckPos);
         if (nearestDist < cfg.ParkedProximityMeters)
         {
-            _status = cands[0].Item3 ? "已在加油站旁，跳过" : "已在休息区旁，跳过";
+            Logger.Info($"AutoRestPark: 已在停靠点旁 {nearestDist:F0} m（阈值 {cfg.ParkedProximityMeters} m），跳过");
+            SetStatus(cands[0].Item3 ? "已在加油站旁，跳过" : "已在休息区旁，跳过");
             _cooldownUntil = _now + Math.Min(cfg.ReTriggerCooldown, 30f);
             return false;
         }
@@ -289,6 +375,7 @@ public class AutoRestParkPlugin : Plugin
         float radius = cfg.SearchRadiusM;
         float sd = cfg.SampleDist;
         _targetDesc = candCopy[0].Item3 ? "加油站" : "休息区";
+        Logger.Info($"AutoRestPark: 触发规划 → 目标={_targetDesc}，最近 {nearestDist:F0} m，候选 {cands.Count} 个");
 
         _planTask = Task.Run(() =>
         {
@@ -319,7 +406,7 @@ public class AutoRestParkPlugin : Plugin
         }
         if (!_planTask.IsCompleted)
         {
-            _status = $"规划路线中…（{_stateTime:F1} s）";
+            SetStatus($"规划路线中…（{_stateTime:F1} s）");
             return;
         }
 
@@ -330,6 +417,7 @@ public class AutoRestParkPlugin : Plugin
 
         if (res == null || res.Points.Count < 2)
         {
+            Logger.Warn("AutoRestPark: 规划失败：未找到可达路线");
             SetIdle("规划失败：未找到可达路线（可能距离过远）");
             _cooldownUntil = _now + cfg.FailCooldown;
             return;
@@ -408,7 +496,7 @@ public class AutoRestParkPlugin : Plugin
 
         _throttle = desired - _speed > 0.3f ? Math.Clamp((desired - _speed) * cfg.ThrottleGain, 0f, 1f) : 0f;
         _brake = _speed - desired > 0.3f ? Math.Clamp((_speed - desired) * cfg.BrakeGain, 0f, 1f) : 0f;
-        _status = $"行驶中 → {_targetDesc}（剩余 {_remaining:F0} m，速度 {_speed:F1}/{desired:F1} m/s）";
+        SetStatus($"行驶中 → {_targetDesc}（剩余 {_remaining:F0} m，速度 {_speed:F1}/{desired:F1} m/s）");
     }
 
     private void TickParking(RestParkSettings cfg, GameTelemetryData td, float dt)
@@ -420,7 +508,7 @@ public class AutoRestParkPlugin : Plugin
         {
             _throttle = 0f;
             _brake = 1f;
-            _status = "停车中…";
+            SetStatus("停车中…");
             return;
         }
         _brake = 0f;
@@ -438,7 +526,7 @@ public class AutoRestParkPlugin : Plugin
                     _parkStage = 1;
                     _parkStageTime = 0f;
                 }
-                _status = "泊车中：拉手刹…";
+                SetStatus("泊车中：拉手刹…");
                 break;
             case 1: // 稍等后按 Enter 触发游戏原生自动泊车
                 if (_parkStageTime > 0.6f)
@@ -454,7 +542,7 @@ public class AutoRestParkPlugin : Plugin
                     }
                     _parkStageTime = 0f;
                 }
-                _status = "泊车中：触发自动泊车…";
+                SetStatus("泊车中：触发自动泊车…");
                 break;
             case 2: // 等待游戏自动泊车完成（若开启熄火则再熄火）
                 if (_parkStageTime > 2.5f)
@@ -464,7 +552,7 @@ public class AutoRestParkPlugin : Plugin
                     _parkStage = 3;
                     _parkStageTime = 0f;
                 }
-                _status = "泊车中：等待游戏自动泊车（若弹出菜单请手动确认）";
+                SetStatus("泊车中：等待游戏自动泊车（若弹出菜单请手动确认）");
                 break;
             case 3:
                 ReleaseOutput();
@@ -477,7 +565,7 @@ public class AutoRestParkPlugin : Plugin
 
     private void TickDone()
     {
-        _status = $"完成，冷却中（{_cooldownUntil - _now:F0} s）";
+        SetStatus($"完成，冷却中（{_cooldownUntil - _now:F0} s）");
         if (_stateTime > 5f)
             SetIdle("待机");
     }
@@ -573,6 +661,19 @@ public class AutoRestParkPlugin : Plugin
         catch { return null; }
     }
 
+    private static string DescribeMap()
+    {
+        try
+        {
+            var installs = GameHandler.Current.Installations;
+            int total = installs.Count, parsed = 0;
+            foreach (var inst in installs)
+                if (inst.IsParsed) parsed++;
+            return $"Installations={total}, IsParsed={parsed}";
+        }
+        catch (Exception ex) { return "查询异常: " + ex.Message; }
+    }
+
     // 收集休息区 + 加油站两类停靠点，合并后按离卡车距离排序（哪个近就优先哪个）
     private static List<(Prefab, Vector3, bool)> FindCandidates(MapData map, Vector3 truckPos)
     {
@@ -629,10 +730,36 @@ public class AutoRestParkPlugin : Plugin
         });
     }
 
+    private void PublishIgnition()
+    {
+        Events.Current.Publish(OutputTopic, new ControlEvent
+        {
+            ChannelDefinition = new ControlChannelDefinition { Id = IgnChannelId, Timeout = 0.5f },
+            Properties = new ControlProperties { Weight = 8f, BooleanType = ControlBooleanType.Direct },
+            Variables = new ControlVariables { ignitionon = true, ignitionstrt = _ignStrt }
+        });
+    }
+
+    private void ReleaseIgnition()
+    {
+        Events.Current.Publish(OutputTopic, new ControlEvent
+        {
+            ChannelDefinition = new ControlChannelDefinition { Id = IgnChannelId, Timeout = 0.5f },
+            Properties = new ControlProperties { Weight = 8f, BooleanType = ControlBooleanType.Direct },
+            Variables = new ControlVariables { ignitionon = false, ignitionstrt = false }
+        });
+        Events.Current.Publish(OutputTopic, new ControlEvent
+        {
+            ChannelDefinition = new ControlChannelDefinition { Id = IgnChannelId },
+            Variables = null!
+        });
+    }
+
     private void ReleaseOutput()
     {
-        if (!_active && !_parkPulse && !_activatePulse && !_ignitionPulse) return;
+        if (!_active && !_parkPulse && !_activatePulse && !_ignitionPulse && !_ignActive) return;
         _active = false;
+        _ignActive = false;
         _steer = 0f;
         _throttle = 0f;
         _brake = 0f;
@@ -651,6 +778,12 @@ public class AutoRestParkPlugin : Plugin
             Properties = new ControlProperties { Weight = 8f, BooleanType = ControlBooleanType.TrueToToggle },
             Variables = new ControlVariables { parkingbrake = false, activate = false, ignitionoff = false }
         });
+        Events.Current.Publish(OutputTopic, new ControlEvent
+        {
+            ChannelDefinition = new ControlChannelDefinition { Id = IgnChannelId, Timeout = 0.5f },
+            Properties = new ControlProperties { Weight = 8f, BooleanType = ControlBooleanType.Direct },
+            Variables = new ControlVariables { ignitionon = false, ignitionstrt = false }
+        });
         // 2) 再删除通道
         Events.Current.Publish(OutputTopic, new ControlEvent
         {
@@ -660,6 +793,11 @@ public class AutoRestParkPlugin : Plugin
         Events.Current.Publish(OutputTopic, new ControlEvent
         {
             ChannelDefinition = new ControlChannelDefinition { Id = ParkChannelId },
+            Variables = null!
+        });
+        Events.Current.Publish(OutputTopic, new ControlEvent
+        {
+            ChannelDefinition = new ControlChannelDefinition { Id = IgnChannelId },
             Variables = null!
         });
     }
@@ -678,14 +816,29 @@ public class AutoRestParkPlugin : Plugin
     {
         _state = PState.Idle;
         _stateTime = 0f;
-        _status = status;
+        SetStatus(status);
     }
 
     private void SetState(PState s, string status)
     {
         _state = s;
         _stateTime = 0f;
-        _status = status;
+        SetStatus(status);
+    }
+
+    private float _lastStatusLogAt = -10f;
+
+    // 状态变化时写日志（最多 1 条/秒），方便从 ets2la.log 远程诊断
+    private void SetStatus(string s)
+    {
+        if (s == _status)
+            return;
+        _status = s;
+        if (_now - _lastStatusLogAt >= 1f)
+        {
+            _lastStatusLogAt = _now;
+            Logger.Info("AutoRestPark: 状态 → " + s);
+        }
     }
 
     // ---------- UI ----------
@@ -699,6 +852,7 @@ public class AutoRestParkPlugin : Plugin
             ImGui.Text($"目标：{_targetDesc}　剩余 {_remaining:F0} m");
         if (_state == PState.Planning)
             ImGui.Text($"目标：{_targetDesc}");
+        ImGui.Text($"诊断：{DescribeMap()}");
         ImGui.Separator();
 
         bool dirty = false;
@@ -712,12 +866,13 @@ public class AutoRestParkPlugin : Plugin
             if (_state is PState.Planning or PState.Driving or PState.Parking)
                 Abort("手动中止", cfg.UserCooldown);
             else
-                _status = "当前待机，无需中止";
+                SetStatus("当前待机，无需中止");
         }
         ImGui.Separator();
 
         dirty |= ImGui.Checkbox("无目的地时自动前往", ref cfg.TriggerWhenNoDestination);
         dirty |= ImGui.Checkbox("缺油时自动前往", ref cfg.TriggerOnLowFuel);
+        dirty |= ImGui.Checkbox("自动点火+松手刹", ref cfg.AutoIgnition);
         dirty |= ImGui.Checkbox("停稳后自动泊车 (Enter)", ref cfg.AutoActivate);
         dirty |= ImGui.Checkbox("停好后熄火", ref cfg.IgnitionOffAfterPark);
         dirty |= ImGui.SliderFloat("巡航速度 (m/s)", ref cfg.MaxSpeed, 15f, 30f);
