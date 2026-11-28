@@ -37,5 +37,6 @@ public class RestParkSettings
     public float SlowdownDistance = 15f;         // 距停车点该距离内限速 2.5 m/s
     public float StopDistance = 10f;             // 距停车点该距离时停车
     public bool AutoActivate = true;             // 停稳后自动按 Enter 触发游戏原生自动泊车
+    public bool AutoIgnition = true;             // 未点火时自动点火 + 自动松手刹
     public bool IgnitionOffAfterPark = false;    // 停好后熄火
 }
