@@ -9,9 +9,11 @@
 ## How it works
 
 1. **触发**：无目的地（没有任务：未接货/已送达/已取消）且非手动驾驶时，确认 2 秒后自动出发；
-   快没油时（fuelWarning 或油量低于阈值）自动改去加油站；也可 UI 手动按钮立即出发。
-2. **选点**：在 ETS2LA 解析出的地图数据（TruckLib MapData）里找最近的休息区 prefab
-   （模型名含 rest/hotel/motel/parking/service）；缺油时优先 gas/fuel/service 类。
+   缺油时（fuelWarning 或油量低于阈值）自动出发；也可 UI 手动按钮立即出发。
+   车未打火会自动点火、手刹未松会自动松开（AutoIgnition）。
+2. **选点**：在 ETS2LA 解析出的地图数据（TruckLib MapData）里找最近的休息区
+   （模型名含 rest/hotel/motel/parking/service）与最近的加油站（gas/fuel），
+   去两者中更近的那一个。
 3. **寻路**：自研 A*（顶点 = 道路节点；边 = 道路长度，prefab 内部走 NavCurve 最短路径），
    目标 = prefab 内最深的停车位节点。
 4. **行驶**：路径采样成 4m 折线，纯追踪转向 + 曲率限速 + 限速牌限速 + 前方车辆障碍减速。
@@ -33,8 +35,13 @@
 1. 关闭 ETS2LA。
 2. 把 `dist\AutoRestPark.dll` 复制到 `%LOCALAPPDATA%\ETS2LA\current\Plugins\`。
 3. 启动 ETS2LA → 设置 → 插件 → 启用「baobao-7799 自动休息区停靠」。
-4. 游戏内按住 **右 Alt** 打开设置窗调参（430×490），也可改
+4. 游戏内按住 **右 Alt** 打开设置窗调参（430×540），也可改
    `%APPDATA%\ETS2LA\fishleia.autorestpark.json`。
+
+## 状态日志（v1.4+）
+
+插件每次状态变化都会写一条 `AutoRestPark: 状态 → …` 到 ETS2LA 的 ets2la.log
+（最多 1 条/秒）。排查「为什么不出发」时看日志里的最后一条状态即可定位卡点。
 
 ## Settings
 
@@ -53,6 +60,7 @@
 | SearchRadiusM / SampleDist | 100000 / 4 | 寻路半径 m / 采样间距 m |
 | SlowdownDistance / StopDistance | 15 / 10 | 减速距离 / 停车距离 m |
 | AutoActivate | true | 停稳后自动按 Enter 触发自动泊车 |
+| AutoIgnition | true | 出发前自动点火+松开手刹 |
 | IgnitionOffAfterPark | false | 停好后熄火 |
 
 ## Safety
